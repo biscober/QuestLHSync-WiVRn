@@ -867,6 +867,14 @@ void Solver::Clear() {
   held_t_ = -1e18;
 }
 
+void Solver::ClearStations() {
+  std::lock_guard<std::mutex> g(m_);
+  S_.clear();
+  ch_.clear();
+  fix_.clear();
+  stale_.clear();
+}
+
 void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright, double sr) {
   std::lock_guard<std::mutex> g(m_);
   rt_.push_back(t); ro_.push_back(o); rd_.push_back(d); rg_.push_back(gt); rc_.push_back(cam); rb_.push_back(bright);
@@ -1448,7 +1456,8 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   if (S.size() < 2 || r.size() < 30) return false;
   Rays t = Thin(r);
   std::vector<X4> H;
-  Hypotheses(t, S, H);
+  int M = S.size() >= 4 ? 1200 : (S.size() >= 3 ? 2000 : 4000);
+  Hypotheses(t, S, H, M);
   std::vector<X4> cand;
   if (has_acq_x_) cand.push_back(acq_x_);
   size_t K = S.size();
@@ -1949,7 +1958,7 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
       say("body " + who, "channel check: " + told("look") + ", but " + how + ": kept as it is");
     } else if (Apart(xs, x_, S) < 0.3) {
       say("same " + who, "channel check: " + told("look") + ", but the rays fit no alignment that way: kept as it is");
-    } else if (!(sc > 0 && sw >= kSwapFit * sc)) {
+    } else if (!(sw > 0 && (sc == 0 || sw >= kSwapFit * sc))) {
       say("kept " + who, "channel check: " + told("look") +
                               Fmt(", but the rays fit that way worse (support %d vs %d): kept as it is", sw, sc));
     } else if (identify(xs, nw) && nw.gain > kSwapGain) {
@@ -2134,8 +2143,8 @@ void Solver::CheckLayout(const std::vector<std::string> &keys, const std::vector
     for (size_t n : fn)
       if (off(q, n) < kNear) sq.insert({r.C[n], r.G[n]});
     std::vector<double> sc;
-    bool scored = SeenScores(view(q, nullptr, sq), tu, P, sc);
-    int i = scored ? named(sc) : -1;
+    if (!SeenScores(view(q, nullptr, sq), tu, P, sc)) continue;
+    int i = named(sc);
     if (i < 0 || par < kPar || std::find(gone.begin(), gone.end(), (size_t)i) == gone.end()) continue;
     size_t k = u[i];
     double worst = 0, moved = norm(q - Pq[k]);
@@ -2714,7 +2723,7 @@ void Sync::Retime(double old_e, double new_e) {
 static std::string Join(const std::string &dir, const char *name) {
   if (dir.empty()) return name;
   char e = dir.back();
-  return dir + ((e == '\\' || e == '/') ? "" : "\\") + name;
+  return dir + ((e == '\\' || e == '/') ? "" : "/") + name;
 }
 
 static StationsFile LoadStations(const std::string &dir) {
@@ -2918,7 +2927,7 @@ void Sync::ApplyHeadset() {
     std::lock_guard<std::mutex> g(st_m_);
     ApplyTiming();
   }
-  log_(Fmt("state for %s: headsets\\%s\\state.json%s", key.c_str(), key.c_str(),
+  log_(Fmt("state for %s: headsets/%s/state.json%s", key.c_str(), key.c_str(),
            adopted ? " (the state.json of earlier versions, moved there)"
                    : quest_.empty() ? " (nothing saved yet)" : Fmt(" (%d base stations saved)", (int)quest_.size()).c_str()));
 }
@@ -3263,7 +3272,12 @@ bool Sync::GravityFrame(M3 &C, M3 &turn, std::string &key) {
 // it than kLevelJump says the level moved (SteamVR re-solved its base stations): it is taken whole and starts over.
 void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
   if (!sfile_.autogen || frame_.ok() != 1 || !solver_.has_x() || now - lock_time_ < kLevelSettle) return;
-  if (!(BodyDist(solver_.x()) < kLevelBody)) return;
+  bool have_body = false;
+  {
+    std::lock_guard<std::mutex> g(body_m_);
+    have_body = !body_.empty();
+  }
+  if (have_body && !(BodyDist(solver_.x()) < kLevelBody)) return;
   Solver::LevelR lv;
   if (!solver_.Level(sfile_.anchor_p, lv)) return;
   double step = RotDeg(lv.tilt);
@@ -3319,22 +3333,28 @@ void Sync::LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, doubl
   std::string left = frame_.left();
   if (left != left_seen_) { left_seen_ = left; left_since_ = now; }
   std::string why;
-  if (bad_since_ >= 0 && now - bad_since_ >= kLayoutMoved)
+  if (bad_since_ >= 0 && (frame_.miss() > 4 * kMoved || now - bad_since_ >= kLayoutMoved))
     why = Fmt("base stations moved (%.0f cm off the fit)", frame_.miss() * 100);
   else if (was && !left.empty() && now - left_since_ >= kLayoutMoved)
     why = "base station " + left + " moved";
-  else if (tilt_since_ >= 0 && now - tilt_since_ >= kLayoutMoved)
+  else if (tilt_since_ >= 0 && (tilt > 2 * kMaxRot || now - tilt_since_ >= kLayoutMoved))
     why = Fmt("the base stations' fit tilts it %.1f deg off SteamVR's level", tilt);
   if (!why.empty() && raw.size() >= 3) {
     sfile_.ref.clear();
     sfile_.ref.insert(raw.begin(), raw.end());
+    if (raw.count(sfile_.anchor)) {
+      sfile_.anchor_p = raw.at(sfile_.anchor).first;
+      sfile_.anchor_R = raw.at(sfile_.anchor).second;
+    }
     sfile_.level = M3();  // SteamVR's frame as it is now: its level is found again
     sfile_.level_n = 0;
     sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
     bad_since_ = tilt_since_ = -1;
     left_since_ = now;
     log_("lighthouse frame: " + why + ": reference frame reset");
+    frame_.Reset();
     frame_.Update(raw);
+    ClearAlignment();
     return;
   }
   int n = 0;
@@ -3499,6 +3519,34 @@ Transform Sync::Tick(double now) {
       chans = channels_;
     }
     for (auto &kv : chans) solver_.SetChannel(kv.first, kv.second);
+    if (sfile_.loaded && sfile_.autogen && !raw.empty()) {
+      bool shared = (raw.find(sfile_.anchor) != raw.end());
+      if (!shared) {
+        for (const auto &kv : raw) {
+          if (sfile_.ref.find(kv.first) != sfile_.ref.end() || sfile_.place.find(kv.first) != sfile_.place.end()) {
+            shared = true;
+            break;
+          }
+        }
+      }
+      if (!shared) {
+        log_("new lighthouse room/universe detected: resetting reference frame for new base stations");
+        for (auto &kv : sfile_.place) solver_.DropFix(kv.first);
+        solver_.ClearStations();
+        solver_.Clear();
+        sfile_ = StationsFile();
+        frame_.Reset();
+        std::remove(Join(cfg_.dir, "stations.json").c_str());
+        place_prior_.clear();
+        place_sess_.clear();
+        place_off_.clear();
+        left_seen_.clear();
+        left_since_ = 0;
+        bad_since_ = tilt_since_ = -1;
+        place_saved_ = -1e18;
+        SaveState(X4{}, {}, true);
+      }
+    }
     if (!sfile_.loaded && !raw.empty()) {  // first run: pin the reference frame to the station at SteamVR's origin
       auto best = raw.begin();
       for (auto it = raw.begin(); it != raw.end(); ++it)

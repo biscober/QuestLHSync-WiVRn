@@ -5,3 +5,7 @@ magisk/build/
 magisk/frida/
 frame/build/
 __pycache__/
+imgui.ini
+questlhsync
+questlhsyncd
+.scratch/

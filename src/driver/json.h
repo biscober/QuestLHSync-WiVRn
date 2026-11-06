@@ -6,29 +6,56 @@
 #include <utility>
 #include <vector>
 
+struct JMember;
+
 struct JVal {
   enum Type { Null, Bool, Num, Str, Arr, Obj } t = Null;
   double n = 0;
   bool b = false;
   std::string s;
   std::vector<JVal> a;
-  std::vector<std::pair<std::string, JVal>> o;
+  std::vector<JMember> o;
 
-  const JVal *get(const char *k) const {
-    if (t != Obj) return nullptr;
-    for (auto &kv : o)
-      if (kv.first == k) return &kv.second;
-    return nullptr;
-  }
+  ~JVal();
+  JVal();
+  JVal(const JVal &);
+  JVal(JVal &&) noexcept;
+  JVal &operator=(const JVal &);
+  JVal &operator=(JVal &&) noexcept;
+
+  const JVal *get(const char *k) const;
   double num(double def = 0) const { return t == Num ? n : def; }
   // numeric array -> doubles (empty if not one)
-  std::vector<double> nums() const {
-    std::vector<double> v;
-    if (t == Arr)
-      for (auto &e : a) v.push_back(e.num());
-    return v;
-  }
+  std::vector<double> nums() const;
 };
+
+struct JMember {
+  std::string first;
+  JVal second;
+  JMember() = default;
+  JMember(std::string k, JVal v) : first(std::move(k)), second(std::move(v)) {}
+};
+
+inline JVal::~JVal() = default;
+inline JVal::JVal() = default;
+inline JVal::JVal(const JVal &) = default;
+inline JVal::JVal(JVal &&) noexcept = default;
+inline JVal &JVal::operator=(const JVal &) = default;
+inline JVal &JVal::operator=(JVal &&) noexcept = default;
+
+inline const JVal *JVal::get(const char *k) const {
+  if (t != Obj) return nullptr;
+  for (auto &kv : o)
+    if (kv.first == k) return &kv.second;
+  return nullptr;
+}
+
+inline std::vector<double> JVal::nums() const {
+  std::vector<double> v;
+  if (t == Arr)
+    for (auto &e : a) v.push_back(e.num());
+  return v;
+}
 
 class JParser {
  public:

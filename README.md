@@ -1,10 +1,83 @@
-# QuestLHSync
+# QuestLHSync (Linux / WiVRn Port)
+
+> **Linux / WiVRn Fork Note:**
+> This branch (`linux-wivrn`) ports the PC side of [CreoleVR/QuestLHSync](https://github.com/CreoleVR/QuestLHSync) from Windows/SteamVR to **Linux with WiVRn (Monado OpenXR)**.
+> - **Tested Environment:** Tested and verified on **CachyOS** with **WiVRn 26.9**, a rooted Meta Quest Pro, 4 SteamVR 2.0 base stations, and 3 Vive Trackers.
+> - **AI Disclosure:** This Linux/WiVRn port was developed from the original upstream project using **Google Antigravity**.
 
 Lighthouse trackers, controllers and base stations aligned to a Quest's or a
 Steam Frame's own tracking, with nothing mounted on the headset. The headset's
 tracking cameras see the laser flashes of SteamVR base stations, and
 QuestLHSync uses them to keep the lighthouse space lined up with the
 headset's while you play. No SpaceCalibrator, no tracker strapped to your head.
+
+---
+
+## Linux / WiVRn Guide
+
+### What Changed vs. the Windows Version
+
+1. **Standalone Daemon Architecture (`questlhsyncd`)**: Instead of injecting an in-process Windows OpenVR driver DLL (`driver_questlhsync.dll`) into SteamVR, the Linux port runs as a standalone background daemon communicating with WiVRn/Monado over Monado's native UNIX domain socket IPC (`libmonado` / `mnd_api`) to dynamically update the `lighthouse` tracking origin offset (`SetTrackingOriginOffset`).
+2. **Headless OpenXR Device Locator & Direct `lighthousedb.json` Ingestion**: Uses a headless OpenXR session with `XR_MNDX_xdev_space` to track HMD and Lighthouse peripherals (Vive Trackers, Index controllers) using monotonic clock (`CLOCK_MONOTONIC`) timestamps, and reads base station constellation geometry, channel assignments, and gravity tilt directly from `~/.local/share/Steam/config/lighthouse/lighthousedb.json` (matching Valve's `driver_lighthouse.so` pose conventions).
+3. **Multi-Room / Universe Transition Support**: Automatically detects when active base station serial numbers change (e.g., moving between a 4-station setup at home and a 2- or 3-station setup at a friend's house) and rebuilds the reference frame in `~/.config/questlhsync/stations.json`.
+4. **POSIX Shared Memory IPC (`/dev/shm/questlhsync`)**: Lock-free atomic seqlock shared memory channel for real-time telemetry and command dispatch between the daemon and GUI.
+5. **Standalone Desktop GUI & Unified Launcher (`questlhsync`)**: Replaces the Windows OpenVR dashboard overlay with a native Linux desktop dashboard built with **Dear ImGui**, GLFW, and OpenGL3. Launching `questlhsync` automatically starts and supervises `questlhsyncd` in the background if it is not already running.
+
+### Linux Requirements
+
+- **Linux distribution** with **WiVRn** (tested on **CachyOS** with **WiVRn 26.9**) configured with Monado's `steamvr_lh` driver so WiVRn sees your Lighthouse trackers/controllers.
+- **SteamVR installed via Steam** (so `driver_lighthouse.so` and `~/.local/share/Steam/config/lighthouse/lighthousedb.json` are present; SteamVR itself does **not** need to be running while using WiVRn).
+- **Rooted Quest Pro, Quest 3, or Quest 3S** with the upstream QuestLHSync Magisk module installed on the headset (see [Headset Install](#install) below), on the same local network as your Linux PC.
+- **Build dependencies**: `cmake` ($\ge 3.20$), a C++20 compiler (`gcc` or `clang`), `pkgconf`, `openxr` headers/loader, `glfw`, and `libglvnd` / OpenGL.
+  - On Arch / CachyOS:
+    ```bash
+    sudo pacman -S --needed base-devel cmake git pkgconf openxr glfw libglvnd
+    ```
+
+### Clone, Build, and Install (Linux)
+
+1. **Clone the repository and checkout `linux-wivrn`:**
+   ```bash
+   git clone -b linux-wivrn https://github.com/biscober/QuestLHSync-WiVRn.git
+   cd QuestLHSync-WiVRn
+   ```
+
+2. **Build with CMake:**
+   ```bash
+   cmake -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build -j$(nproc)
+   ```
+   This produces two main executables in `build/`:
+   - `build/questlhsync` — Desktop GUI dashboard + unified launcher (spawns the daemon automatically if not already running).
+   - `build/questlhsyncd` — Standalone headless synchronization daemon.
+
+3. *(Optional)* **Install to `~/.local/bin` (or `/usr/local/bin`):**
+   ```bash
+   install -Dm755 build/questlhsync ~/.local/bin/questlhsync
+   install -Dm755 build/questlhsyncd ~/.local/bin/questlhsyncd
+   ```
+
+### Running on Linux with WiVRn
+
+1. Start **WiVRn** (`wivrn-server`), connect your Quest headset, and switch on at least one **Vive Tracker or Index controller** so `driver_lighthouse.so` inside WiVRn sees your base stations.
+2. Start **QuestLHSync**:
+   - **With the Desktop GUI (Recommended):**
+     ```bash
+     ./build/questlhsync
+     ```
+     *(If `questlhsyncd` is not already running, `questlhsync` will automatically launch it in the background.)*
+   - **Headless Daemon Only:**
+     ```bash
+     ./build/questlhsyncd --headless
+     ```
+3. Put on the headset and look/move around naturally for ~10–30 seconds so the Quest's tracking cameras catch the base stations. Once locked, the base station indicators turn **green** and your Lighthouse trackers will align with your Quest tracking space automatically.
+
+> **Linux Files & Logs:**
+> Configuration, logs, and per-headset state live in `~/.config/questlhsync/` (`questlhsync.log`, `stations.json`, `headsets/<model>-<id>/state.json`, and `recordings/`).
+
+---
+
+## Original Upstream Documentation (Windows / SteamVR & Headset Module)
 
 It has two parts: a **headset part**, which serves what the cameras see on your
 local network (a Magisk module on a Quest, a user service and a small SteamVR
@@ -17,8 +90,6 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
 Galaxy XR support is by [@stearnsbq](https://github.com/stearnsbq), with the
 [questlhsync-galaxy-xr](https://github.com/stearnsbq/questlhsync-galaxy-xr)
 headset module.
-
-![The QuestLHSync dashboard page](docs/dashboard.png)
 
 ## Requirements
 

@@ -324,6 +324,7 @@ class Solver {
   void SetMotion(MotionFn f) { motion_ = std::move(f); }
   void Reset(const X4 &x);
   void Clear();  // forgets the sightings, the alignment and what hung on them; the stations stay (Sync::ForceRecalibrate)
+  void ClearStations();
   // g: the frame's time on the headset's clock (NaN until the frame grid is known)
   void Add(double t, V3 o, V3 d, double g, int cam, bool bright, double sr);
   void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
@@ -493,6 +494,10 @@ class Sync {
   void OnBodyPose(int dev, double t, V3 raw);  // lighthouse controllers and trackers (raw lighthouse universe)
   void SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw);
   void SetChannels(const std::map<std::string, int> &ch);
+  bool HasRawStations() {
+    std::lock_guard<std::mutex> g(raw_m_);
+    return !raw_.empty();
+  }
   void SetStreamer(const std::string &system);
   // the headset this session talks to (its serial and model from its hello): state.json is kept per headset. Safe from
   // any thread; Tick takes it up

@@ -1,4 +1,17 @@
+#ifdef _WIN32
 #include <windows.h>
+#include "MinHook.h"
+#else
+#include <cstdint>
+#include <ctime>
+#include <unistd.h>
+
+static uint64_t GetTickCount64() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+#endif
 
 #include "relations.h"
 
@@ -9,7 +22,6 @@
 #include <fstream>
 #include <sstream>
 
-#include "MinHook.h"
 #include "json.h"
 
 namespace {
@@ -22,6 +34,7 @@ constexpr size_t kKeepRel = 30;                     // the newest relationships 
 constexpr int kSayPerMin = 10;                      // log lines a minute at most
 constexpr uint64_t kSaveMs = 10000;                 // relations.json written at most this often
 
+#ifdef _WIN32
 // the relationship step's log line, and its arguments as it takes them: mov r13, r9 (the pose); mov r15d, r8d and
 // mov r12d, edx (the two stations' serials)
 const char kMoving[] = "Moving base %08X %.0fmm and %.1f deg because of relationship with %08X";
@@ -43,6 +56,7 @@ uint64_t Detour(void *self, uint64_t a, uint64_t b, const float *rel, uint64_t s
   }
   return g_orig(self, a, b, use ? avg : rel, s5, s6, s7, s8);
 }
+#endif
 
 std::string Fmt(const char *fmt, ...) {
   char buf[512];
@@ -90,6 +104,7 @@ Relations::Pose Relations::Mean(const std::vector<Pose> &v) {
   return {{s.w / n, s.x / n, s.y / n, s.z / n}, t * (1.0 / v.size())};
 }
 
+#ifdef _WIN32
 void *Relations::Find(void *module, std::string &why) {
   auto *base = (uint8_t *)module;
   auto *dos = (IMAGE_DOS_HEADER *)base;
@@ -171,6 +186,19 @@ bool Relations::Hook() {
 void Relations::Unhook() {
   if (target_) MH_DisableHook(target_);
 }
+#else
+void *Relations::Find(void * /*module*/, std::string &why) {
+  why = "driver_lighthouse hooking is not supported on Linux";
+  return nullptr;
+}
+
+bool Relations::Hook() {
+  return true;
+}
+
+void Relations::Unhook() {
+}
+#endif
 
 bool Relations::Average(uint32_t a, uint32_t b, const float rel[7], float out[7]) {
   if (!enabled_ || a == b || !a || !b) return false;
@@ -261,16 +289,22 @@ void Relations::Flush(bool now) {
   }
   for (auto &l : said) log_(l);
   if (s.empty()) return;
-  std::string path = dir_ + "\\relations.json", tmp = path + ".tmp";
+  std::string sep = (!dir_.empty() && (dir_.back() == '/' || dir_.back() == '\\')) ? "" : "/";
+  std::string path = dir_ + sep + "relations.json", tmp = path + ".tmp";
   FILE *f = fopen(tmp.c_str(), "wb");
   if (!f) return;
   fwrite(s.data(), 1, s.size(), f);
   fclose(f);
+#ifdef _WIN32
   MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+#else
+  rename(tmp.c_str(), path.c_str());
+#endif
 }
 
 void Relations::Load() {
-  std::ifstream f(dir_ + "\\relations.json", std::ios::binary);
+  std::string sep = (!dir_.empty() && (dir_.back() == '/' || dir_.back() == '\\')) ? "" : "/";
+  std::ifstream f(dir_ + sep + "relations.json", std::ios::binary);
   if (!f) return;
   std::stringstream ss;
   ss << f.rdbuf();
