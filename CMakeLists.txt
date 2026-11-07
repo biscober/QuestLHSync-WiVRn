@@ -34,7 +34,19 @@ target_include_directories(qlhs_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/driver
   ${CMAKE_CURRENT_SOURCE_DIR}/src/common
 )
-target_link_libraries(qlhs_core PUBLIC Threads::Threads)
+target_link_libraries(qlhs_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+
+# Optional preload library to hook driver_lighthouse.so inside wivrn-server / vrserver
+add_library(qlhs_relations SHARED
+  src/driver/relations_preload.cpp
+  src/driver/relations.cpp
+)
+target_include_directories(qlhs_relations PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/driver
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+)
+target_link_libraries(qlhs_relations PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
 # Monado / OpenXR adapter library (Ticket 03)
 add_library(qlhs_driver STATIC

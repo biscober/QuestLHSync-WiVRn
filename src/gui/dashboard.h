@@ -39,9 +39,19 @@ public:
   Dashboard() = default;
   ~Dashboard() = default;
 
+  void SetConfigDir(std::string dir) { config_dir_ = std::move(dir); }
+  const std::string &GetConfigDir() const { return config_dir_; }
+
   // Renders the full 1280x800 dashboard interface using Dear ImGui.
   // Sends commands via `reader` if provided and interactive buttons are pressed.
   void Render(const QlhsStatus &status, bool is_connected_and_fresh, ShmReader *reader = nullptr);
+
+private:
+  std::string config_dir_;
+  char host_buf_[64] = "";
+  bool config_loaded_ = false;
+  std::string feedback_msg_;
+  double feedback_until_ = 0.0;
 };
 
 } // namespace qlhs

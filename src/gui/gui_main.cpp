@@ -59,6 +59,8 @@ int main(int argc, char *argv[]) {
   qlhs::DaemonConfig cfg;
   cfg.config_dir = qlhs::GetDefaultConfigDir();
 
+  qlhs::LoadConfigFile(cfg.config_dir, cfg);
+
   std::string error_msg;
   auto parse_res = qlhs::ParseDaemonConfig(argc, argv, cfg, &run_headless, &error_msg);
   if (parse_res == qlhs::CliParseResult::Help) {
@@ -69,6 +71,10 @@ int main(int argc, char *argv[]) {
     std::cerr << error_msg << "\n";
     PrintUsage(argv[0]);
     return 1;
+  }
+
+  if (!cfg.hosts.empty()) {
+    qlhs::SaveConfigFile(cfg.config_dir, cfg.hosts[0], cfg.preferred_headset);
   }
 
   // --- Headless / Daemon Execution Mode ---
@@ -101,6 +107,22 @@ int main(int argc, char *argv[]) {
       daemon_args.push_back("--shm");
       daemon_args.push_back(cfg.shm_name);
     }
+    for (const auto &h : cfg.hosts) {
+      daemon_args.push_back("--host");
+      daemon_args.push_back(h);
+    }
+    if (!cfg.preferred_headset.empty()) {
+      daemon_args.push_back("--preferred");
+      daemon_args.push_back(cfg.preferred_headset);
+    }
+    if (!cfg.streamer.empty()) {
+      daemon_args.push_back("--streamer");
+      daemon_args.push_back(cfg.streamer);
+    }
+    if (!cfg.lighthouse_origin_name.empty()) {
+      daemon_args.push_back("--origin");
+      daemon_args.push_back(cfg.lighthouse_origin_name);
+    }
     if (cfg.verbose) {
       daemon_args.push_back("--verbose");
     }
@@ -119,6 +141,13 @@ int main(int argc, char *argv[]) {
     }
   } else {
     std::cout << "Attached to existing active QuestLHSync daemon on " << shm_name << ".\n";
+    if (!cfg.hosts.empty()) {
+      std::cout << "Updating target headset host on active daemon to " << cfg.hosts[0] << "...\n";
+      qlhs::ShmReader cmd_reader(shm_name);
+      if (cmd_reader.Open()) {
+        cmd_reader.SendCommand(QLHS_CMD_RELOAD_CONFIG);
+      }
+    }
   }
 
   // --- Initialize GLFW & OpenGL Window ---
@@ -219,6 +248,7 @@ int main(int argc, char *argv[]) {
   qlhs::ShmReader reader(shm_name);
   reader.Open();
   qlhs::Dashboard dashboard;
+  dashboard.SetConfigDir(cfg.config_dir);
   QlhsStatus last_status{};
   double last_reopen_try = 0.0;
 

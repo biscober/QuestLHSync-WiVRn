@@ -57,6 +57,15 @@ void TestStateText() {
   assert(title == "Looking for the headset");
   assert(sub.find("lhsyncd") != std::string::npos);
 
+  // QLHS_SEARCHING with explicit target IP
+  std::strcpy(s.headset_addr, "192.168.1.113");
+  qlhs::StateText(s, false, title, sub, color);
+  assert(color == col::amber);
+  assert(title == "Looking for the headset");
+  assert(sub.find("192.168.1.113") != std::string::npos);
+  assert(sub.find("lhsyncd") != std::string::npos);
+  s.headset_addr[0] = '\0';
+
   // QLHS_CONNECTING
   s.state = QLHS_CONNECTING;
   qlhs::StateText(s, false, title, sub, color);

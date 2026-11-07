@@ -72,6 +72,10 @@ void HeadsetLink::Stop() {
 void HeadsetLink::SetHosts(const std::vector<std::string> &h) {
   std::lock_guard<std::mutex> g(m_);
   hosts_ = h;
+  for (const auto &ip : hosts_) {
+    quiet_ips_.erase(ip);
+    wrong_ips_.erase(ip);
+  }
 }
 
 void HeadsetLink::SetPreferred(const std::string &serial) {
@@ -183,7 +187,10 @@ void HeadsetLink::Remember(const Known &k) {
 // a headset that sent no camera frames goes after all of them
 int HeadsetLink::Rank(const std::string &ip, const std::string &id) const {
   int r = quiet_ips_.count(ip) ? 1000 : 0;
-  if (!id.empty() && id == HeadsetId(preferred_)) return r;
+  for (const auto &h : hosts_) {
+    if (h == ip) return r;  // Explicitly configured target host gets top rank priority
+  }
+  if (!id.empty() && id == HeadsetId(preferred_)) return r + 10;
   for (size_t i = 0; i < known_.size(); i++)
     if (SameHeadset(known_[i], ip, id))
       return r + (!streamer_.empty() && known_[i].streamer == streamer_ ? 100 : 200) + (int)i;
@@ -224,29 +231,43 @@ void HeadsetLink::Loop() {
     // (a network dropping broadcasts), each after one that answered at the same rank
     std::vector<std::pair<int, Found>> cand;
     std::string fam;
+    std::vector<std::string> target_hosts;
     {
       std::lock_guard<std::mutex> g(m_);
       fam = family_;
+      target_hosts = hosts_;
+      auto is_target = [&](const std::string &ip) {
+        if (target_hosts.empty()) return true;
+        for (const auto &th : target_hosts) {
+          if (th == ip) return true;
+        }
+        return false;
+      };
       auto listed = [&](const std::string &ip) {
         for (auto &c : cand)
           if (c.second.ip == ip) return true;
         return false;
       };
       answered_.clear();
-      for (auto &f : found)
+      for (auto &f : found) {
         if (Fits(fam, f.model)) {
-          cand.push_back({2 * Rank(f.ip, HeadsetId(f.serial)), f});
           answered_.insert(f.ip);
+          if (is_target(f.ip)) {
+            cand.push_back({2 * Rank(f.ip, HeadsetId(f.serial)), f});
+          }
         }
-      for (auto &h : hosts_)
+      }
+      for (auto &h : target_hosts) {
         if (!wrong_ips_.count(h) && !listed(h)) {
           int r = Rank(h, "");
-          if (r % 1000 == 300) r -= 50;  // not remembered: still ahead of new headsets that answered
           cand.push_back({2 * r + 1, {h, "", "", kTcpPort}});
         }
-      for (auto &k : known_)
-        if (Fits(fam, k.model) && !wrong_ips_.count(k.ip) && !listed(k.ip))
-          cand.push_back({2 * Rank(k.ip, k.id) + 1, {k.ip, "", "", kTcpPort}});
+      }
+      if (target_hosts.empty()) {
+        for (auto &k : known_)
+          if (Fits(fam, k.model) && !wrong_ips_.count(k.ip) && !listed(k.ip))
+            cand.push_back({2 * Rank(k.ip, k.id) + 1, {k.ip, "", "", kTcpPort}});
+      }
     }
     std::stable_sort(cand.begin(), cand.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
     bool fitting = false;
@@ -255,8 +276,13 @@ void HeadsetLink::Loop() {
       skipped_ = found[0].serial;
       log_(found[0].model + " at " + found[0].ip + " answers, but SteamVR's headset is a " + fam + ": not used");
     }
-    if (found.empty() && quiet++ % 30 == 0)
-      log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
+    if (found.empty() && quiet++ % 30 == 0) {
+      if (!target_hosts.empty()) {
+        log_("no response from target headset " + target_hosts[0] + " (is it awake, with lhsyncd running?)");
+      } else {
+        log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
+      }
+    }
     for (auto &c : cand)
       if (run_ && wanted_ && Session(c.second)) {
         quiet = 0;
@@ -460,6 +486,20 @@ bool HeadsetLink::Session(const Found &f) {
   }
   char buf[65536];
   while (run_ && wanted_ && ok) {
+    // If target hosts were reconfigured, ensure current session matches
+    {
+      std::lock_guard<std::mutex> g(m_);
+      if (!hosts_.empty()) {
+        bool allowed = false;
+        for (const auto &h : hosts_) {
+          if (h == f.ip) { allowed = true; break; }
+        }
+        if (!allowed) {
+          log_("disconnecting from " + f.ip + ": manual target host changed to " + hosts_[0]);
+          break;
+        }
+      }
+    }
     double now = QpcNow();
     if (!framed && !quiet_checked && now - start > quiet_after) {  // once: memory and hosts don't change meanwhile
       quiet_checked = true;
@@ -601,6 +641,10 @@ bool HeadsetLink::Session(const Found &f) {
     in.erase(0, pos);
   }
   closesocket(s);
+  {
+    std::lock_guard<std::mutex> g(m_);
+    addr_.clear();
+  }
   state_ = kSearching;
   return !wrong;
 }

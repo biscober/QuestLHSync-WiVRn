@@ -48,6 +48,8 @@ int main(int argc, char *argv[]) {
   cfg.config_dir = qlhs::GetDefaultConfigDir();
   cfg.headless = true;
 
+  qlhs::LoadConfigFile(cfg.config_dir, cfg);
+
   std::string error_msg;
   auto parse_res = qlhs::ParseDaemonConfig(argc, argv, cfg, nullptr, &error_msg);
   if (parse_res == qlhs::CliParseResult::Help) {
@@ -58,6 +60,10 @@ int main(int argc, char *argv[]) {
     std::cerr << error_msg << "\n";
     PrintUsage(argv[0]);
     return 1;
+  }
+
+  if (!cfg.hosts.empty()) {
+    qlhs::SaveConfigFile(cfg.config_dir, cfg.hosts[0], cfg.preferred_headset);
   }
 
   std::cout << "[questlhsyncd] Starting QuestLHSync daemon on Linux (WiVRn / Monado)..." << std::endl;

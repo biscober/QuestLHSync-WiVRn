@@ -32,6 +32,7 @@ enum QlhsCmd : int32_t {
   QLHS_CMD_RECORD_ON = 4,
   QLHS_CMD_RECORD_OFF = 5,
   QLHS_CMD_RECALIBRATE = 6,  // drop every learned and saved alignment of this headset and start over
+  QLHS_CMD_RELOAD_CONFIG = 7,  // reload settings from config.json (target host, preferred serial)
 };
 
 #pragma pack(push, 8)

@@ -853,6 +853,310 @@ void TestPeripheralRawPoseDirect() {
   std::cout << "[test_daemon] TestPeripheralRawPoseDirect PASSED" << std::endl;
 }
 
+void TestConfigFilePersistenceAndReload() {
+  std::cout << "[test_daemon] Running TestConfigFilePersistenceAndReload..." << std::endl;
+  std::string test_dir = "/tmp/qlhs_test_config_" + std::to_string(getpid());
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::create_directories(test_dir);
+
+  // 1. Save config
+  assert(qlhs::SaveConfigFile(test_dir, "192.168.1.113", "TEST_HEADSET_01"));
+
+  // 2. Load config
+  qlhs::DaemonConfig loaded_cfg;
+  assert(qlhs::LoadConfigFile(test_dir, loaded_cfg));
+  assert(loaded_cfg.hosts.size() == 1);
+  assert(loaded_cfg.hosts[0] == "192.168.1.113");
+  assert(loaded_cfg.preferred_headset == "TEST_HEADSET_01");
+
+  // 3. Initialize coordinator with config_dir
+  std::string shm_name = "/qlhs_cfg_test_" + std::to_string(getpid());
+  qlhs::DaemonConfig coord_cfg;
+  coord_cfg.config_dir = test_dir;
+  coord_cfg.shm_name = shm_name;
+  coord_cfg.enable_openxr = false;
+  coord_cfg.enable_monado = false;
+  coord_cfg.enable_lighthousedb_poll = false;
+  coord_cfg.enable_headset_link = false; // test offline logic
+
+  qlhs::DaemonCoordinator coord(coord_cfg);
+  assert(coord.Initialize());
+  assert(coord.GetConfig().hosts.size() == 1);
+  assert(coord.GetConfig().hosts[0] == "192.168.1.113");
+
+  coord.Step(0.1);
+  QlhsStatus st{};
+  qlhs::ShmReader reader(shm_name);
+  assert(reader.Open());
+  assert(reader.Read(st));
+  assert(std::string(st.headset_addr) == "192.168.1.113");
+
+  // 4. Update config on disk
+  assert(qlhs::SaveConfigFile(test_dir, "192.168.1.222", "TEST_HEADSET_02"));
+
+  // 5. Trigger reload via command
+  assert(reader.SendCommand(QLHS_CMD_RELOAD_CONFIG));
+  coord.Step(0.2);
+
+  assert(coord.GetConfig().hosts.size() == 1);
+  assert(coord.GetConfig().hosts[0] == "192.168.1.222");
+  assert(coord.GetConfig().preferred_headset == "TEST_HEADSET_02");
+
+  assert(reader.Read(st));
+  assert(std::string(st.headset_addr) == "192.168.1.222");
+
+  coord.Stop();
+  std::filesystem::remove_all(test_dir);
+  std::cout << "[test_daemon] TestConfigFilePersistenceAndReload PASSED" << std::endl;
+}
+
+void TestRelationsAveragingAndElfFind() {
+  std::cout << "[test_daemon] Running TestRelationsAveragingAndElfFind..." << std::endl;
+  std::string test_shm = "/qlhs_test_rel_" + std::to_string(getpid());
+  std::filesystem::path config_dir =
+      std::filesystem::temp_directory_path() / ("qlhs_cfg_rel_" + std::to_string(getpid()));
+  std::filesystem::remove_all(config_dir);
+  std::filesystem::create_directories(config_dir);
+
+  auto write_db = [&](double tx, double ty, double tz) {
+    std::ofstream db_out(config_dir / "lighthousedb.json");
+    db_out << R"({
+      "base_stations": [
+        { "config": { "serialNumber": 2620154763 }, "dynamic_states": [ { "time_last_seen": 1794030000, "dynamic_state": { "sobChannel": 6 } } ] },
+        { "config": { "serialNumber": 1410481594 }, "dynamic_states": [ { "time_last_seen": 1794030000, "dynamic_state": { "sobChannel": 4 } } ] }
+      ],
+      "known_universes": [
+        {
+          "id": "1794025416",
+          "tilt": { "pitch": 0.487831652, "roll": -0.0409073159, "variance": 8.16e-06 },
+          "tilt_to_pose_method": 0,
+          "base_stations": [
+            {
+              "base_serial_number": 2620154763,
+              "target_pose": { "pose": [0, 0, 0, 1, 0, 0, 0], "variance": 0 }
+            },
+            {
+              "base_serial_number": 1410481594,
+              "target_pose": { "pose": [0.008435, 0.619675, 0.354752, 0.700059, )"
+           << tx << ", " << ty << ", " << tz << R"(], "variance": 7.2e-05 }
+            }
+          ]
+        }
+      ]
+    })";
+    db_out.close();
+  };
+
+  // Initial clean measurement of LHB-54123DBA (1410481594)
+  write_db(2.489485, 1.015909, -1.829042);
+
+  qlhs::DaemonConfig cfg;
+  cfg.config_dir = config_dir.string();
+  cfg.shm_name = test_shm;
+  cfg.enable_headset_link = false;
+  cfg.enable_openxr = false;
+  cfg.enable_monado = false;
+  cfg.enable_lighthousedb_poll = true;
+  cfg.steady_stations = true;
+  cfg.lighthousedb_path = (config_dir / "lighthousedb.json").string();
+
+  qlhs::DaemonCoordinator coord(cfg);
+  assert(coord.Initialize());
+  coord.Step(1.0);
+  // Step again without modifying lighthousedb.json: must not duplicate sample
+  coord.Step(7.0);
+  coord.GetRelations()->Flush(true);
+
+  auto count_samples = [&]() -> size_t {
+    std::ifstream rf(config_dir / "relations.json");
+    assert(rf.is_open());
+    std::string rjson((std::istreambuf_iterator<char>(rf)), std::istreambuf_iterator<char>());
+    JVal rroot;
+    assert(JParse(rjson, rroot));
+    const JVal *pairs = rroot.get("pairs");
+    assert(pairs && pairs->t == JVal::Obj);
+    const JVal *arr = pairs->get("LHB-54123DBA LHB-9C2C638B");
+    assert(arr && arr->t == JVal::Arr);
+    return arr->a.size();
+  };
+  assert(count_samples() == 1);
+
+  // Now simulate a 6 cm noisy jump in lighthousedb.json: should be averaged in (2 samples)
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  write_db(2.489485, 1.075909, -1.829042);
+  coord.Step(15.0);
+  coord.GetRelations()->Flush(true);
+  assert(count_samples() == 2);
+
+  // Now simulate a single 25 cm outlier spike (> kFarM = 15 cm): should be rejected (still 2 samples)
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  write_db(2.489485, 1.300000, -1.829042);
+  coord.Step(25.0);
+  coord.GetRelations()->Flush(true);
+  assert(count_samples() == 2);
+
+  coord.Stop();
+  std::filesystem::remove_all(config_dir);
+  std::cout << "[test_daemon] TestRelationsAveragingAndElfFind PASSED" << std::endl;
+}
+
+void TestSpaceMoverStageOffsetInvariance() {
+  std::cout << "[test_daemon] Running TestSpaceMoverStageOffsetInvariance..." << std::endl;
+
+  std::string test_shm = "/qlhs_test_spacemover_" + std::to_string(getpid());
+  std::filesystem::path config_dir =
+      std::filesystem::temp_directory_path() / ("qlhs_cfg_spacemover_" + std::to_string(getpid()));
+  std::filesystem::remove_all(config_dir);
+  std::filesystem::create_directories(config_dir);
+
+  auto mock_openxr = std::make_shared<MockOpenXrLocator>();
+  auto mock_monado = std::make_shared<MockMonadoIpc>();
+  uint32_t lh_id = mock_monado->AddTrackingOrigin("Lighthouse Tracking Origin", MndPose{});
+
+  qlhs::DaemonConfig cfg;
+  cfg.config_dir = config_dir.string();
+  cfg.shm_name = test_shm;
+  cfg.enable_headset_link = false;
+  cfg.enable_openxr = true;
+  cfg.enable_monado = true;
+  cfg.enable_lighthousedb_poll = false;
+  cfg.per_headset = false;
+  cfg.arrival_clock = true;
+  cfg.learn_timing = false;
+  cfg.lighthouse_origin_name = "lighthouse";
+  cfg.verbose = false;
+
+  qlhs::DaemonCoordinator coord(cfg, mock_openxr, mock_monado);
+  assert(coord.Initialize());
+
+  std::string err;
+  assert(coord.SetCalibration(MakeTestCalibrationJson(), &err));
+  coord.GetSync()->SetStreamer("WiVRn");
+
+  const double yaw_l = 20.0 * M_PI / 180.0;
+  const double yaw_r = -20.0 * M_PI / 180.0;
+  const double pitch = 10.0 * M_PI / 180.0;
+  CamInfo cams[2];
+  cams[0].id = 0;
+  cams[0].R_dfc = Ry(yaw_l) * Rx(pitch);
+  cams[0].t_dfc = V3{ -0.05, 0.02, 0.06 };
+  cams[1].id = 1;
+  cams[1].R_dfc = Ry(yaw_r) * Rx(pitch);
+  cams[1].t_dfc = V3{ 0.05, 0.02, 0.06 };
+
+  const double gt_yaw = 0.38;
+  const V3 gt_t = { 0.45, 0.12, -0.35 };
+
+  struct BaseStation {
+    std::string serial;
+    V3 pos_lh;
+    M3 rot_lh;
+  };
+  std::vector<BaseStation> bs_list = {
+    { "LHB-00000001", { 0.0, 2.0, 0.0 }, M3() },
+    { "LHB-00000002", { 2.4, 2.2, 2.6 }, M3() },
+    { "LHB-00000003", { -2.2, 2.1, 2.4 }, M3() }
+  };
+
+  std::map<std::string, std::pair<V3, M3>> raw_stations;
+  for (const auto &bs : bs_list) {
+    raw_stations[bs.serial] = { bs.pos_lh, bs.rot_lh };
+  }
+  coord.GetSync()->SetStationsRaw(raw_stations);
+
+  auto get_head_pose = [](double t_val) {
+    double yaw = 0.22 * std::sin(0.6 * t_val);
+    M3 R = Ry(yaw);
+    V3 p = { 0.35 * std::sin(0.45 * t_val), 1.60 + 0.04 * std::sin(0.9 * t_val), 0.35 * std::cos(0.45 * t_val) };
+    return std::make_pair(R, p);
+  };
+
+  auto [R_init, p_init] = get_head_pose(0.0);
+  mock_openxr->AddMockDevice("HMD_PRO", "Meta Quest Pro HMD", true, Transform{true, ToQuat(R_init), p_init});
+  mock_openxr->AddMockDevice("LHR-79F8E140", "Vive Tracker 3.0", false, Transform{true, Quat{1, 0, 0, 0}, V3{0, 1.0, 0}});
+
+  for (double t = -1.0; t < 0.0; t += 0.01) {
+    auto [R, p] = get_head_pose(t);
+    coord.GetSync()->OnHmdPose(t, ToQuat(R), p);
+  }
+
+  const double t_end = 18.0;
+  const double dt_pose = 1.0 / 90.0;
+  const double dt_cam = 1.0 / 30.0;
+  double next_cam = 0.0;
+  unsigned frame_seq = 0;
+
+  for (double t = 0.0; t <= t_end; t += dt_pose) {
+    // Simulate WayVR Space Mover actively dragging STAGE reference space after t = 3.0s
+    Transform stage_xf{true, Quat{1, 0, 0, 0}, V3{0, 0, 0}};
+    if (t >= 3.0) {
+      stage_xf = Transform{true, ToQuat(Ry(0.25)), V3{1.25, -0.95 + 0.1 * std::sin(t), 2.10}};
+    }
+    mock_monado->SetReferenceSpaceOffset(MND_REFERENCE_SPACE_TYPE_STAGE, ToMndPose(stage_xf));
+
+    auto [R_hmd, p_hmd] = get_head_pose(t);
+    Transform raw_hmd{true, ToQuat(R_hmd), p_hmd};
+    // Monado's u_space_overseer locates spaces relative to STAGE as Inverse(T_stage) * T_origin * P_raw
+    Transform hmd_in_stage = Compose(Inverse(stage_xf), raw_hmd);
+    mock_openxr->SetMockDevicePose("HMD_PRO", hmd_in_stage, true);
+
+    MndPose cur_lh_pose{};
+    mock_monado->GetTrackingOriginOffset(lh_id, cur_lh_pose);
+    Transform lh_xf = ToTransform(cur_lh_pose);
+    Transform raw_tracker{true, Quat{1, 0, 0, 0}, V3{0.1, 1.0, -0.2}};
+    Transform tracker_in_stage = Compose(Inverse(stage_xf), Compose(lh_xf, raw_tracker));
+    mock_openxr->SetMockDevicePose("LHR-79F8E140", tracker_in_stage, true);
+
+    if (t >= next_cam) {
+      next_cam += dt_cam;
+      long long tus = (long long)(t * 1e6);
+      double t_expo = t - kExpoArrival;
+      auto [R_cam_hmd, p_cam_hmd] = get_head_pose(t_expo);
+
+      for (int c = 0; c < 2; c++) {
+        const CamInfo &cam = cams[c];
+        V3 p_cam_world = p_cam_hmd + R_cam_hmd * cam.t_dfc;
+        M3 R_cam_world = R_cam_hmd * cam.R_dfc;
+
+        std::vector<std::pair<double, double>> visible_pixels;
+        for (const auto &bs : bs_list) {
+          V3 p_station_quest = Ry(gt_yaw) * bs.pos_lh + gt_t;
+          V3 d_world = p_station_quest - p_cam_world;
+          V3 d_cam = T(R_cam_world) * d_world;
+          double px = 0.0, py = 0.0;
+          if (cam.Project(d_cam, px, py)) {
+            visible_pixels.push_back({px, py});
+          }
+        }
+        if (!visible_pixels.empty()) {
+          char line[512];
+          int off = snprintf(line, sizeof(line), "F %d %u %lld 10 %d", cam.id, ++frame_seq, tus, (int)visible_pixels.size());
+          for (const auto &pix : visible_pixels) {
+            int x10 = (int)std::round(pix.first * 10.0);
+            int y10 = (int)std::round(pix.second * 10.0);
+            off += snprintf(line + off, sizeof(line) - off, " %d %d 12 255", x10, y10);
+          }
+          coord.FeedHeadsetLine(line, t);
+        }
+      }
+    }
+
+    coord.Step(t);
+  }
+
+  MndPose final_offset{};
+  assert(mock_monado->GetTrackingOriginOffset(lh_id, final_offset) == MND_SUCCESS);
+  V3 solved_t = ToV3(final_offset.position);
+  double pos_err = norm(solved_t - gt_t);
+  std::cout << "  SpaceMover solved t = (" << solved_t.x << ", " << solved_t.y << ", " << solved_t.z
+            << "), err = " << pos_err << " m" << std::endl;
+  assert(pos_err < 0.05);
+
+  coord.Stop();
+  std::filesystem::remove_all(config_dir);
+  std::cout << "[test_daemon] TestSpaceMoverStageOffsetInvariance PASSED" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -869,6 +1173,9 @@ int main() {
   TestUniverseTransition();
   TestLighthouseDbTilt();
   TestPeripheralRawPoseDirect();
+  TestConfigFilePersistenceAndReload();
+  TestRelationsAveragingAndElfFind();
+  TestSpaceMoverStageOffsetInvariance();
 
   std::cout << "===========================================" << std::endl;
   std::cout << "All QuestLHSync Daemon Tests PASSED!" << std::endl;

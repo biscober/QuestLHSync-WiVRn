@@ -100,7 +100,8 @@ MonadoIpcClient::~MonadoIpcClient() {
 }
 
 bool MonadoIpcClient::Connect() {
-  if (IsConnected()) return true;
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
+  if (root_ != nullptr) return true;
 
   std::vector<std::string> candidate_paths;
   if (!custom_lib_path_.empty()) {
@@ -137,17 +138,37 @@ bool MonadoIpcClient::Connect() {
   pfn_get_origin_name_ = reinterpret_cast<PFN_mnd_root_get_tracking_origin_name>(dlsym(dl_handle_, "mnd_root_get_tracking_origin_name"));
   pfn_get_origin_offset_ = reinterpret_cast<PFN_mnd_root_get_tracking_origin_offset>(dlsym(dl_handle_, "mnd_root_get_tracking_origin_offset"));
   pfn_set_origin_offset_ = reinterpret_cast<PFN_mnd_root_set_tracking_origin_offset>(dlsym(dl_handle_, "mnd_root_set_tracking_origin_offset"));
+  pfn_get_ref_space_offset_ = reinterpret_cast<PFN_mnd_root_get_reference_space_offset>(dlsym(dl_handle_, "mnd_root_get_reference_space_offset"));
+  pfn_set_ref_space_offset_ = reinterpret_cast<PFN_mnd_root_set_reference_space_offset>(dlsym(dl_handle_, "mnd_root_set_reference_space_offset"));
 
   if (!pfn_create_ || !pfn_destroy_ || !pfn_get_origin_count_ ||
       !pfn_get_origin_name_ || !pfn_get_origin_offset_ || !pfn_set_origin_offset_) {
-    Disconnect();
+    dlclose(dl_handle_);
+    dl_handle_ = nullptr;
+    pfn_create_ = nullptr;
+    pfn_destroy_ = nullptr;
+    pfn_get_origin_count_ = nullptr;
+    pfn_get_origin_name_ = nullptr;
+    pfn_get_origin_offset_ = nullptr;
+    pfn_set_origin_offset_ = nullptr;
+    pfn_get_ref_space_offset_ = nullptr;
+    pfn_set_ref_space_offset_ = nullptr;
     return false;
   }
 
   int res = pfn_create_(&root_);
   if (res != MND_SUCCESS || !root_) {
     root_ = nullptr;
-    Disconnect();
+    dlclose(dl_handle_);
+    dl_handle_ = nullptr;
+    pfn_create_ = nullptr;
+    pfn_destroy_ = nullptr;
+    pfn_get_origin_count_ = nullptr;
+    pfn_get_origin_name_ = nullptr;
+    pfn_get_origin_offset_ = nullptr;
+    pfn_set_origin_offset_ = nullptr;
+    pfn_get_ref_space_offset_ = nullptr;
+    pfn_set_ref_space_offset_ = nullptr;
     return false;
   }
 
@@ -155,6 +176,7 @@ bool MonadoIpcClient::Connect() {
 }
 
 void MonadoIpcClient::Disconnect() {
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
   if (root_ && pfn_destroy_) {
     pfn_destroy_(&root_);
     root_ = nullptr;
@@ -169,19 +191,24 @@ void MonadoIpcClient::Disconnect() {
   pfn_get_origin_name_ = nullptr;
   pfn_get_origin_offset_ = nullptr;
   pfn_set_origin_offset_ = nullptr;
+  pfn_get_ref_space_offset_ = nullptr;
+  pfn_set_ref_space_offset_ = nullptr;
 }
 
 bool MonadoIpcClient::IsConnected() const {
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
   return root_ != nullptr;
 }
 
 int MonadoIpcClient::GetTrackingOriginCount(uint32_t &out_count) {
-  if (!IsConnected() || !pfn_get_origin_count_) return MND_ERROR_OPERATION_FAILED;
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
+  if (!root_ || !pfn_get_origin_count_) return MND_ERROR_OPERATION_FAILED;
   return pfn_get_origin_count_(root_, &out_count);
 }
 
 int MonadoIpcClient::GetTrackingOriginName(uint32_t origin_id, std::string &out_name) {
-  if (!IsConnected() || !pfn_get_origin_name_) return MND_ERROR_OPERATION_FAILED;
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
+  if (!root_ || !pfn_get_origin_name_) return MND_ERROR_OPERATION_FAILED;
   const char *name_ptr = nullptr;
   int res = pfn_get_origin_name_(root_, origin_id, &name_ptr);
   if (res == MND_SUCCESS && name_ptr) {
@@ -191,12 +218,14 @@ int MonadoIpcClient::GetTrackingOriginName(uint32_t origin_id, std::string &out_
 }
 
 int MonadoIpcClient::GetTrackingOriginOffset(uint32_t origin_id, MndPose &out_offset) {
-  if (!IsConnected() || !pfn_get_origin_offset_) return MND_ERROR_OPERATION_FAILED;
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
+  if (!root_ || !pfn_get_origin_offset_) return MND_ERROR_OPERATION_FAILED;
   return pfn_get_origin_offset_(root_, origin_id, &out_offset);
 }
 
 int MonadoIpcClient::SetTrackingOriginOffset(uint32_t origin_id, const MndPose &offset) {
-  if (!IsConnected() || !pfn_set_origin_offset_) return MND_ERROR_OPERATION_FAILED;
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
+  if (!root_ || !pfn_set_origin_offset_) return MND_ERROR_OPERATION_FAILED;
   return pfn_set_origin_offset_(root_, origin_id, &offset);
 }
 
@@ -206,22 +235,37 @@ static std::string ToLower(std::string str) {
 }
 
 int MonadoIpcClient::FindTrackingOriginByName(const std::string &substring, uint32_t &out_id) {
-  if (!IsConnected()) return MND_ERROR_OPERATION_FAILED;
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
+  if (!root_ || !pfn_get_origin_count_ || !pfn_get_origin_name_) return MND_ERROR_OPERATION_FAILED;
   uint32_t count = 0;
-  int res = GetTrackingOriginCount(count);
+  int res = pfn_get_origin_count_(root_, &count);
   if (res != MND_SUCCESS) return res;
 
   std::string lower_sub = ToLower(substring);
   for (uint32_t i = 0; i < count; i++) {
-    std::string name;
-    if (GetTrackingOriginName(i, name) == MND_SUCCESS) {
-      if (ToLower(name).find(lower_sub) != std::string::npos) {
+    const char *name_ptr = nullptr;
+    if (pfn_get_origin_name_(root_, i, &name_ptr) == MND_SUCCESS && name_ptr) {
+      if (ToLower(name_ptr).find(lower_sub) != std::string::npos) {
         out_id = i;
         return MND_SUCCESS;
       }
     }
   }
   return MND_ERROR_INVALID_VALUE;
+}
+
+int MonadoIpcClient::GetReferenceSpaceOffset(MndReferenceSpaceType type, MndPose &out_offset) {
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
+  if (!root_) return MND_ERROR_OPERATION_FAILED;
+  if (!pfn_get_ref_space_offset_) return MND_ERROR_UNSUPPORTED_OPERATION;
+  return pfn_get_ref_space_offset_(root_, static_cast<int>(type), &out_offset);
+}
+
+int MonadoIpcClient::SetReferenceSpaceOffset(MndReferenceSpaceType type, const MndPose &offset) {
+  std::lock_guard<std::mutex> lock(ipc_mutex_);
+  if (!root_) return MND_ERROR_OPERATION_FAILED;
+  if (!pfn_set_ref_space_offset_) return MND_ERROR_UNSUPPORTED_OPERATION;
+  return pfn_set_ref_space_offset_(root_, static_cast<int>(type), &offset);
 }
 
 // -----------------------------------------------------------------------------
@@ -231,34 +275,42 @@ int MonadoIpcClient::FindTrackingOriginByName(const std::string &substring, uint
 MockMonadoIpc::MockMonadoIpc() = default;
 
 bool MockMonadoIpc::Connect() {
+  std::lock_guard<std::mutex> lock(mutex_);
   connected_ = true;
   return true;
 }
 
 void MockMonadoIpc::Disconnect() {
+  std::lock_guard<std::mutex> lock(mutex_);
   connected_ = false;
 }
 
 bool MockMonadoIpc::IsConnected() const {
+  std::lock_guard<std::mutex> lock(mutex_);
   return connected_;
 }
 
 uint32_t MockMonadoIpc::AddTrackingOrigin(const std::string &name, const MndPose &initial_offset) {
+  std::lock_guard<std::mutex> lock(mutex_);
   origins_.push_back({name, initial_offset});
   return static_cast<uint32_t>(origins_.size() - 1);
 }
 
 void MockMonadoIpc::ClearOrigins() {
+  std::lock_guard<std::mutex> lock(mutex_);
   origins_.clear();
+  ref_spaces_.clear();
 }
 
 int MockMonadoIpc::GetTrackingOriginCount(uint32_t &out_count) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!connected_) return MND_ERROR_OPERATION_FAILED;
   out_count = static_cast<uint32_t>(origins_.size());
   return MND_SUCCESS;
 }
 
 int MockMonadoIpc::GetTrackingOriginName(uint32_t origin_id, std::string &out_name) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!connected_) return MND_ERROR_OPERATION_FAILED;
   if (origin_id >= origins_.size()) return MND_ERROR_INVALID_VALUE;
   out_name = origins_[origin_id].name;
@@ -266,6 +318,7 @@ int MockMonadoIpc::GetTrackingOriginName(uint32_t origin_id, std::string &out_na
 }
 
 int MockMonadoIpc::GetTrackingOriginOffset(uint32_t origin_id, MndPose &out_offset) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!connected_) return MND_ERROR_OPERATION_FAILED;
   if (origin_id >= origins_.size()) return MND_ERROR_INVALID_VALUE;
   out_offset = origins_[origin_id].offset;
@@ -273,6 +326,7 @@ int MockMonadoIpc::GetTrackingOriginOffset(uint32_t origin_id, MndPose &out_offs
 }
 
 int MockMonadoIpc::SetTrackingOriginOffset(uint32_t origin_id, const MndPose &offset) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!connected_) return MND_ERROR_OPERATION_FAILED;
   if (origin_id >= origins_.size()) return MND_ERROR_INVALID_VALUE;
   origins_[origin_id].offset = offset;
@@ -280,6 +334,7 @@ int MockMonadoIpc::SetTrackingOriginOffset(uint32_t origin_id, const MndPose &of
 }
 
 int MockMonadoIpc::FindTrackingOriginByName(const std::string &substring, uint32_t &out_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!connected_) return MND_ERROR_OPERATION_FAILED;
   std::string lower_sub = ToLower(substring);
   for (size_t i = 0; i < origins_.size(); i++) {
@@ -289,4 +344,23 @@ int MockMonadoIpc::FindTrackingOriginByName(const std::string &substring, uint32
     }
   }
   return MND_ERROR_INVALID_VALUE;
+}
+
+int MockMonadoIpc::GetReferenceSpaceOffset(MndReferenceSpaceType type, MndPose &out_offset) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!connected_) return MND_ERROR_OPERATION_FAILED;
+  auto it = ref_spaces_.find(type);
+  if (it != ref_spaces_.end()) {
+    out_offset = it->second;
+  } else {
+    out_offset = MndPose{};
+  }
+  return MND_SUCCESS;
+}
+
+int MockMonadoIpc::SetReferenceSpaceOffset(MndReferenceSpaceType type, const MndPose &offset) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!connected_) return MND_ERROR_OPERATION_FAILED;
+  ref_spaces_[type] = offset;
+  return MND_SUCCESS;
 }

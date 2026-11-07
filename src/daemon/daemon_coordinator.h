@@ -1,15 +1,18 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/qlhs_shm.h"
@@ -17,6 +20,7 @@
 #include "driver/monado_adapter.h"
 #include "driver/net.h"
 #include "driver/openxr_locator.h"
+#include "driver/relations.h"
 #include "driver/sync.h"
 
 namespace qlhs {
@@ -33,6 +37,7 @@ struct DaemonConfig {
   bool enable_openxr = true;
   bool enable_monado = true;
   bool enable_lighthousedb_poll = true;
+  bool steady_stations = true;
   std::string lighthousedb_path;
   bool per_headset = true;
   bool arrival_clock = false;
@@ -76,6 +81,8 @@ public:
 
   Sync *GetSync() noexcept { return sync_.get(); }
   const Sync *GetSync() const noexcept { return sync_.get(); }
+  Relations *GetRelations() noexcept { return relations_.get(); }
+  const Relations *GetRelations() const noexcept { return relations_.get(); }
   ShmPublisher &GetShmPublisher() noexcept { return shm_pub_; }
   const DaemonConfig &GetConfig() const noexcept { return config_; }
 
@@ -88,6 +95,7 @@ public:
   // Command handlers
   void HandleCommand(QlhsCmd cmd);
   void SetRecording(bool on);
+  void ReloadConfig();
 
   // Logging
   void Log(const std::string &msg);
@@ -96,6 +104,7 @@ private:
   void WorkerLoop();
   void PollOpenXr(double now);
   void PollLighthouseDb(double now);
+  void PollConfigFile(double now);
   void StepSolver(double now);
   bool EnsureMonadoConnected(double now);
   void ApplyMonadoOffset(const Transform &xf);
@@ -109,6 +118,11 @@ private:
 
   std::unique_ptr<Sync> sync_;
   std::unique_ptr<HeadsetLink> link_;
+  std::unique_ptr<Relations> relations_;
+  bool rel_done_ = true;
+  double started_ = 0.0;
+  std::map<std::pair<uint32_t, uint32_t>, std::array<float, 7>> last_raw_rel_;
+  std::map<std::pair<uint32_t, uint32_t>, std::array<float, 7>> last_avg_rel_;
 
   std::atomic<bool> initialized_{false};
   std::atomic<bool> running_{false};
@@ -127,6 +141,7 @@ private:
   bool origin_id_resolved_ = false;
   mutable std::mutex lh_offset_mutex_;
   Transform current_lh_offset_{};
+  Transform current_stage_offset_{};
   double last_monado_connect_try_ = -1e9;
   double last_openxr_retry_ = -1e9;
   double last_lighthousedb_poll_ = -1e9;
@@ -135,6 +150,8 @@ private:
 
   double last_step_ = -1e9;
   double last_publish_ = -1e9;
+  double last_config_check_ = -1e9;
+  std::filesystem::file_time_type config_file_mtime_{};
   std::atomic<double> last_pose_heartbeat_{-1e9};
 
   std::atomic<bool> recording_{false};
@@ -150,6 +167,14 @@ private:
 
 // Resolves XDG config directory ($XDG_CONFIG_HOME/questlhsync or ~/.config/questlhsync)
 std::string GetDefaultConfigDir();
+
+// Loads config from ${config_dir}/config.json into cfg.
+// Returns true if config was read and parsed successfully.
+bool LoadConfigFile(const std::string &config_dir, DaemonConfig &cfg, std::string *err = nullptr);
+
+// Saves host and preferred_headset to ${config_dir}/config.json.
+// Returns true on success.
+bool SaveConfigFile(const std::string &config_dir, const std::string &host, const std::string &preferred = "", std::string *err = nullptr);
 
 enum class CliParseResult {
   Success,

@@ -98,6 +98,22 @@ bool DaemonCoordinator::Initialize() {
   std::error_code ec;
   std::filesystem::create_directories(config_.config_dir, ec);
 
+  // Load config.json if hosts or preferred headset not supplied via CLI
+  if (config_.hosts.empty() || config_.preferred_headset.empty()) {
+    DaemonConfig disk_cfg;
+    if (LoadConfigFile(config_.config_dir, disk_cfg)) {
+      if (config_.hosts.empty()) config_.hosts = disk_cfg.hosts;
+      if (config_.preferred_headset.empty()) config_.preferred_headset = disk_cfg.preferred_headset;
+    }
+  }
+
+  std::filesystem::path cfg_file = std::filesystem::path(config_.config_dir) / "config.json";
+  std::error_code ec_mtime;
+  auto mtime = std::filesystem::last_write_time(cfg_file, ec_mtime);
+  if (!ec_mtime) {
+    config_file_mtime_ = mtime;
+  }
+
   std::string log_path = (std::filesystem::path(config_.config_dir) / "questlhsync.log").string();
   log_file_ = std::fopen(log_path.c_str(), "a");
 
@@ -111,6 +127,11 @@ bool DaemonCoordinator::Initialize() {
   sc.learn_timing = config_.learn_timing;
   sync_ = std::make_unique<Sync>(sc, [this](const std::string &s) { Log(s); });
   sync_->SetStreamer(config_.streamer);
+
+  relations_ = std::make_unique<Relations>(config_.config_dir, [this](const std::string &s) { Log(s); });
+  relations_->SetEnabled(config_.steady_stations);
+  started_ = QpcNow();
+  rel_done_ = !config_.steady_stations || relations_->Hook();
 
   // Initialize HeadsetLink if enabled
   if (config_.enable_headset_link) {
@@ -155,7 +176,18 @@ bool DaemonCoordinator::Initialize() {
         Log("Found tracking origin '" + config_.lighthouse_origin_name + "' with id " + std::to_string(lighthouse_origin_id_));
       } else {
         lighthouse_origin_id_ = config_.default_origin_id;
+        origin_id_resolved_ = true;
         Log("Defaulting tracking origin id to " + std::to_string(lighthouse_origin_id_));
+      }
+      MndPose cur_pose{};
+      if (monado_->GetTrackingOriginOffset(lighthouse_origin_id_, cur_pose) == MND_SUCCESS) {
+        std::lock_guard<std::mutex> g(lh_offset_mutex_);
+        current_lh_offset_ = ToTransform(cur_pose);
+      }
+      MndPose stage_pose{};
+      if (monado_->GetReferenceSpaceOffset(MND_REFERENCE_SPACE_TYPE_STAGE, stage_pose) == MND_SUCCESS) {
+        std::lock_guard<std::mutex> g(lh_offset_mutex_);
+        current_stage_offset_ = ToTransform(stage_pose);
       }
     } else {
       Log("Monado IPC connection deferred (libmonado not loaded or runtime not ready)");
@@ -199,6 +231,11 @@ void DaemonCoordinator::Stop() {
   }
   if (monado_) {
     monado_->Disconnect();
+  }
+  if (relations_) {
+    relations_->Unhook();
+    relations_->Flush(true);
+    relations_.reset();
   }
   shm_pub_.Close();
   shm_pub_.Unlink();
@@ -279,6 +316,7 @@ void DaemonCoordinator::Step(double now) {
   }
 
   PollLighthouseDb(now);
+  PollConfigFile(now);
 
   if (link_) {
     link_->SetWanted(hmd_located_.load(std::memory_order_relaxed));
@@ -286,6 +324,13 @@ void DaemonCoordinator::Step(double now) {
 
   PollCommands();
   StepSolver(now);
+
+  if (relations_) {
+    if (!rel_done_ && now - started_ < 60.0) {
+      rel_done_ = relations_->Hook();
+    }
+    relations_->Flush();
+  }
 
   double pub_now = (live_clock || running_.load(std::memory_order_relaxed)) ? QpcNow() : now;
   double min_interval = 1.0 / std::max(10.0, config_.publish_rate_hz);
@@ -311,12 +356,34 @@ void DaemonCoordinator::PollOpenXr(double now) {
   openxr_->PollEvents();
   openxr_->UpdateDevices();
 
+  if (config_.enable_monado && monado_ && monado_->IsConnected()) {
+    MndPose stage_pose{};
+    if (monado_->GetReferenceSpaceOffset(MND_REFERENCE_SPACE_TYPE_STAGE, stage_pose) == MND_SUCCESS) {
+      std::lock_guard<std::mutex> g(lh_offset_mutex_);
+      current_stage_offset_ = ToTransform(stage_pose);
+    }
+  }
+
+  Transform stage_offset;
+  Transform lh_offset;
+  {
+    std::lock_guard<std::mutex> g(lh_offset_mutex_);
+    stage_offset = current_stage_offset_;
+    lh_offset = current_lh_offset_;
+  }
+
   XrTime xr_now = openxr_->ConvertTimeToXrTime(now);
 
   // Locate HMD
   Transform hmd_xf;
   bool hmd_valid = false;
   if (openxr_->LocateHmd(hmd_xf, hmd_valid, xr_now) && hmd_valid) {
+    if (stage_offset.active) {
+      // OpenXrLocator locates spaces relative to XR_REFERENCE_SPACE_TYPE_STAGE,
+      // which includes any playspace mover offset (e.g. WayVR Space Drag) as T_stage^-1.
+      // Left-multiply by T_stage to recover the un-dragged root coordinate.
+      hmd_xf = Compose(stage_offset, hmd_xf);
+    }
     hmd_located_.store(true, std::memory_order_relaxed);
     if (sync_) {
       sync_->OnHmdPose(now, hmd_xf.q, hmd_xf.t);
@@ -338,16 +405,17 @@ void DaemonCoordinator::PollOpenXr(double now) {
       continue;
     }
 
+    if (stage_offset.active) {
+      dev_xf = Compose(stage_offset, dev_xf);
+    }
+
     if (IsTrackingReference(dev.name, dev.serial)) {
       V3 p_raw = dev_xf.t;
       M3 R_raw = ToM3(dev_xf.q);
-      {
-        std::lock_guard<std::mutex> g(lh_offset_mutex_);
-        if (current_lh_offset_.active) {
-          M3 R_inv = T(ToM3(current_lh_offset_.q));
-          p_raw = R_inv * (dev_xf.t - current_lh_offset_.t);
-          R_raw = R_inv * R_raw;
-        }
+      if (lh_offset.active) {
+        M3 R_inv = T(ToM3(lh_offset.q));
+        p_raw = R_inv * (dev_xf.t - lh_offset.t);
+        R_raw = R_inv * R_raw;
       }
       raw_stations[dev.serial] = {p_raw, R_raw};
     } else if (IsLighthousePeripheral(dev.name, dev.serial)) {
@@ -355,11 +423,8 @@ void DaemonCoordinator::PollOpenXr(double now) {
         // OpenXR MNDX xdev spaces are children of their Monado tracking origin space.
         // Invert the active lighthouse tracking origin offset to recover raw lighthouse coordinates.
         V3 p_raw = dev_xf.t;
-        {
-          std::lock_guard<std::mutex> g(lh_offset_mutex_);
-          if (current_lh_offset_.active) {
-            p_raw = TransformPoint(Inverse(current_lh_offset_), dev_xf.t);
-          }
+        if (lh_offset.active) {
+          p_raw = TransformPoint(Inverse(lh_offset), dev_xf.t);
         }
         sync_->OnBodyPose(static_cast<int>(dev.dev_id), now, p_raw);
       }
@@ -587,6 +652,23 @@ void DaemonCoordinator::PollLighthouseDb(double now) {
     }
   }
 
+  uint32_t origin_serial = 0;
+  for (const auto &ub : u_bs->a) {
+    const JVal *bsn = ub.get("base_serial_number");
+    if (!bsn || bsn->t != JVal::Num) continue;
+    const JVal *tp = ub.get("target_pose");
+    if (!tp) continue;
+    const JVal *pv = tp->get("pose");
+    if (!pv || pv->t != JVal::Arr || pv->a.size() < 7) continue;
+    std::vector<double> p = pv->nums();
+    if (p.size() < 7) continue;
+    double d2 = p[4] * p[4] + p[5] * p[5] + p[6] * p[6];
+    if (d2 < 1e-6) {
+      origin_serial = static_cast<uint32_t>(bsn->n);
+      break;
+    }
+  }
+
   std::map<std::string, std::pair<V3, M3>> l_stations;
   std::map<std::string, int> channels;
 
@@ -618,6 +700,41 @@ void DaemonCoordinator::PollLighthouseDb(double now) {
     std::vector<double> p = pv->nums();
     if (p.size() < 7) continue;
 
+    if (relations_ && config_.steady_stations && origin_serial != 0 && num != origin_serial) {
+      std::array<float, 7> rel = {
+          static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]),
+          static_cast<float>(p[3]), static_cast<float>(p[4]), static_cast<float>(p[5]),
+          static_cast<float>(p[6])};
+      auto key = std::make_pair(origin_serial, num);
+      bool changed = true;
+      auto it_raw = last_raw_rel_.find(key);
+      if (it_raw != last_raw_rel_.end()) {
+        changed = false;
+        for (int i = 0; i < 7; ++i) {
+          if (std::fabs(rel[i] - it_raw->second[i]) > 1e-6f) {
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (changed) {
+        last_raw_rel_[key] = rel;
+        float avg[7];
+        if (relations_->Average(origin_serial, num, rel.data(), avg)) {
+          std::array<float, 7> avg_arr = {avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6]};
+          last_avg_rel_[key] = avg_arr;
+          for (int i = 0; i < 7; ++i) p[i] = avg[i];
+        } else {
+          last_avg_rel_.erase(key);
+        }
+      } else {
+        auto it_avg = last_avg_rel_.find(key);
+        if (it_avg != last_avg_rel_.end()) {
+          for (int i = 0; i < 7; ++i) p[i] = it_avg->second[i];
+        }
+      }
+    }
+
     // p is [qx, qy, qz, qw, x, y, z] representing T_base_from_origin.
     // Invert T_base_from_origin to get T_origin_from_base = (R_inv, -R_inv * raw_pos),
     // then left-multiply by R_level to obtain the levelled universe pose matching driver_lighthouse.so.
@@ -627,6 +744,10 @@ void DaemonCoordinator::PollLighthouseDb(double now) {
     V3 pos = R_level * (R_inv * (raw_pos * -1.0));
     M3 rot = R_level * R_inv;
     l_stations[s_name] = {pos, rot};
+  }
+
+  if (relations_) {
+    relations_->Flush();
   }
 
   if (!l_stations.empty() && sync_) {
@@ -652,6 +773,11 @@ bool DaemonCoordinator::EnsureMonadoConnected(double now) {
     if (monado_->GetTrackingOriginOffset(lighthouse_origin_id_, cur_pose) == MND_SUCCESS) {
       std::lock_guard<std::mutex> g(lh_offset_mutex_);
       current_lh_offset_ = ToTransform(cur_pose);
+    }
+    MndPose stage_pose{};
+    if (monado_->GetReferenceSpaceOffset(MND_REFERENCE_SPACE_TYPE_STAGE, stage_pose) == MND_SUCCESS) {
+      std::lock_guard<std::mutex> g(lh_offset_mutex_);
+      current_stage_offset_ = ToTransform(stage_pose);
     }
   };
 
@@ -740,6 +866,9 @@ void DaemonCoordinator::HandleCommand(QlhsCmd cmd) {
       break;
     case QLHS_CMD_RECORD_OFF:
       SetRecording(false);
+      break;
+    case QLHS_CMD_RELOAD_CONFIG:
+      ReloadConfig();
       break;
     case QLHS_CMD_REACQUIRE:
     case QLHS_CMD_NONE:
@@ -837,7 +966,13 @@ void DaemonCoordinator::PublishTelemetry(double now) {
   }
   SafeCopy(st.hmd_system, sizeof(st.hmd_system), hmd_system_);
   SafeCopy(st.headset, sizeof(st.headset), (link_ && !link_->model().empty()) ? link_->model() : headset_model_);
-  SafeCopy(st.headset_addr, sizeof(st.headset_addr), (link_ && ls == HeadsetLink::kConnected) ? link_->addr() : "");
+  std::string display_addr;
+  if (link_ && ls == HeadsetLink::kConnected) {
+    display_addr = link_->addr();
+  } else if (!config_.hosts.empty()) {
+    display_addr = config_.hosts[0];
+  }
+  SafeCopy(st.headset_addr, sizeof(st.headset_addr), display_addr);
   SafeCopy(st.headset_fw, sizeof(st.headset_fw), link_ ? link_->fw() : "");
 
   st.cam_fps = s.cam_fps;
@@ -933,6 +1068,124 @@ void DaemonCoordinator::SetHeadsetInfo(const std::string &serial, const std::str
   if (sync_) {
     sync_->SetHeadset(serial, model);
   }
+}
+
+void DaemonCoordinator::ReloadConfig() {
+  DaemonConfig new_cfg = config_;
+  new_cfg.hosts.clear();
+  if (LoadConfigFile(config_.config_dir, new_cfg)) {
+    bool hosts_changed = (new_cfg.hosts != config_.hosts);
+    bool pref_changed = (new_cfg.preferred_headset != config_.preferred_headset);
+    config_.hosts = new_cfg.hosts;
+    config_.preferred_headset = new_cfg.preferred_headset;
+    config_.steady_stations = new_cfg.steady_stations;
+    if (relations_) {
+      relations_->SetEnabled(config_.steady_stations);
+    }
+    if (link_) {
+      link_->SetHosts(config_.hosts);
+      link_->SetPreferred(config_.preferred_headset);
+    }
+    if (hosts_changed || pref_changed) {
+      std::string h_str = config_.hosts.empty() ? "auto-discover" : config_.hosts[0];
+      Log("Configuration reloaded from config.json: target host=" + h_str +
+          (config_.preferred_headset.empty() ? "" : ", preferred=" + config_.preferred_headset));
+    }
+  }
+}
+
+void DaemonCoordinator::PollConfigFile(double now) {
+  if (now - last_config_check_ < 1.0) return;
+  last_config_check_ = now;
+
+  std::filesystem::path p = std::filesystem::path(config_.config_dir) / "config.json";
+  std::error_code ec;
+  auto mtime = std::filesystem::last_write_time(p, ec);
+  if (!ec) {
+    if (config_file_mtime_ == std::filesystem::file_time_type{} || mtime != config_file_mtime_) {
+      config_file_mtime_ = mtime;
+      ReloadConfig();
+    }
+  }
+}
+
+bool LoadConfigFile(const std::string &config_dir, DaemonConfig &cfg, std::string *err) {
+  if (config_dir.empty()) return false;
+  std::filesystem::path p = std::filesystem::path(config_dir) / "config.json";
+  std::ifstream f(p);
+  if (!f.is_open()) return false;
+  std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  f.close();
+
+  JVal root;
+  if (!JParse(text, root) || root.t != JVal::Obj) {
+    if (err) *err = "Failed to parse JSON in " + p.string();
+    return false;
+  }
+
+  if (const JVal *h = root.get("host")) {
+    if (h->t == JVal::Str) {
+      if (!h->s.empty()) {
+        cfg.hosts = { h->s };
+      } else {
+        cfg.hosts.clear();
+      }
+    }
+  } else if (const JVal *hv = root.get("hosts")) {
+    if (hv->t == JVal::Arr) {
+      cfg.hosts.clear();
+      for (const auto &item : hv->a) {
+        if (item.t == JVal::Str && !item.s.empty()) {
+          cfg.hosts.push_back(item.s);
+        }
+      }
+    }
+  }
+  if (const JVal *pref = root.get("preferred")) {
+    if (pref->t == JVal::Str) cfg.preferred_headset = pref->s;
+  }
+  if (const JVal *st = root.get("streamer")) {
+    if (st->t == JVal::Str && !st->s.empty()) cfg.streamer = st->s;
+  }
+  if (const JVal *ss = root.get("steadyStations")) {
+    if (ss->t == JVal::Bool) cfg.steady_stations = ss->b;
+  }
+  return true;
+}
+
+bool SaveConfigFile(const std::string &config_dir, const std::string &host, const std::string &preferred, std::string *err) {
+  if (config_dir.empty()) return false;
+  std::error_code ec;
+  std::filesystem::create_directories(config_dir, ec);
+
+  std::filesystem::path p = std::filesystem::path(config_dir) / "config.json";
+  std::filesystem::path tmp_p = std::filesystem::path(config_dir) / "config.json.tmp";
+
+  std::ofstream f(tmp_p);
+  if (!f.is_open()) {
+    if (err) *err = "Failed to open temporary file for writing: " + tmp_p.string();
+    return false;
+  }
+
+  std::string streamer = "WiVRn";
+  DaemonConfig cur_cfg;
+  if (LoadConfigFile(config_dir, cur_cfg) && !cur_cfg.streamer.empty()) {
+    streamer = cur_cfg.streamer;
+  }
+
+  f << "{\n";
+  f << "  \"host\": \"" << host << "\",\n";
+  f << "  \"preferred\": \"" << preferred << "\",\n";
+  f << "  \"streamer\": \"" << streamer << "\"\n";
+  f << "}\n";
+  f.close();
+
+  std::filesystem::rename(tmp_p, p, ec);
+  if (ec) {
+    if (err) *err = "Failed to rename temp file: " + ec.message();
+    return false;
+  }
+  return true;
 }
 
 CliParseResult ParseDaemonConfig(

@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <memory>
 
 #include <openxr/openxr.h>
 
@@ -118,6 +120,8 @@ public:
   virtual int GetTrackingOriginOffset(uint32_t origin_id, MndPose &out_offset) = 0;
   virtual int SetTrackingOriginOffset(uint32_t origin_id, const MndPose &offset) = 0;
   virtual int FindTrackingOriginByName(const std::string &substring, uint32_t &out_id) = 0;
+  virtual int GetReferenceSpaceOffset(MndReferenceSpaceType type, MndPose &out_offset) = 0;
+  virtual int SetReferenceSpaceOffset(MndReferenceSpaceType type, const MndPose &offset) = 0;
 };
 
 class MonadoIpcClient : public IMonadoIpc {
@@ -134,8 +138,11 @@ public:
   int GetTrackingOriginOffset(uint32_t origin_id, MndPose &out_offset) override;
   int SetTrackingOriginOffset(uint32_t origin_id, const MndPose &offset) override;
   int FindTrackingOriginByName(const std::string &substring, uint32_t &out_id) override;
+  int GetReferenceSpaceOffset(MndReferenceSpaceType type, MndPose &out_offset) override;
+  int SetReferenceSpaceOffset(MndReferenceSpaceType type, const MndPose &offset) override;
 
 private:
+  mutable std::mutex ipc_mutex_;
   std::string custom_lib_path_;
   void *dl_handle_ = nullptr;
   mnd_root_ptr root_ = nullptr;
@@ -147,6 +154,8 @@ private:
   PFN_mnd_root_get_tracking_origin_name pfn_get_origin_name_ = nullptr;
   PFN_mnd_root_get_tracking_origin_offset pfn_get_origin_offset_ = nullptr;
   PFN_mnd_root_set_tracking_origin_offset pfn_set_origin_offset_ = nullptr;
+  PFN_mnd_root_get_reference_space_offset pfn_get_ref_space_offset_ = nullptr;
+  PFN_mnd_root_set_reference_space_offset pfn_set_ref_space_offset_ = nullptr;
 };
 
 class MockMonadoIpc : public IMonadoIpc {
@@ -163,6 +172,8 @@ public:
   int GetTrackingOriginOffset(uint32_t origin_id, MndPose &out_offset) override;
   int SetTrackingOriginOffset(uint32_t origin_id, const MndPose &offset) override;
   int FindTrackingOriginByName(const std::string &substring, uint32_t &out_id) override;
+  int GetReferenceSpaceOffset(MndReferenceSpaceType type, MndPose &out_offset) override;
+  int SetReferenceSpaceOffset(MndReferenceSpaceType type, const MndPose &offset) override;
 
   // Mock-specific helpers
   uint32_t AddTrackingOrigin(const std::string &name, const MndPose &initial_offset = MndPose{});
@@ -173,6 +184,8 @@ private:
     std::string name;
     MndPose offset;
   };
+  mutable std::mutex mutex_;
   bool connected_ = false;
   std::vector<OriginEntry> origins_;
+  std::map<MndReferenceSpaceType, MndPose> ref_spaces_;
 };

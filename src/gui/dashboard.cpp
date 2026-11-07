@@ -1,5 +1,7 @@
 #include "gui/dashboard.h"
 #include "common/qlhs_shm.h"
+#include "daemon/daemon_coordinator.h"
+#include "driver/net.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -44,7 +46,11 @@ void StateText(const QlhsStatus &s, bool stale, std::string &title, std::string 
       break;
     case QLHS_SEARCHING:
       title = "Looking for the headset";
-      sub = "No headset with QuestLHSync's lhsyncd answers on the network. Is it awake and on the same Wi-Fi?";
+      if (s.headset_addr[0]) {
+        sub = "Searching for lhsyncd at " + std::string(s.headset_addr) + ". Is it awake and on the same Wi-Fi?";
+      } else {
+        sub = "No headset with QuestLHSync's lhsyncd answers on the network. Is it awake and on the same Wi-Fi?";
+      }
       color = col::amber;
       break;
     case QLHS_CONNECTING:
@@ -120,6 +126,19 @@ std::string Dur(double s) {
 }
 
 void Dashboard::Render(const QlhsStatus &s, bool is_connected_and_fresh, ShmReader *reader) {
+  if (!config_loaded_) {
+    DaemonConfig dc;
+    if (!config_dir_.empty() && LoadConfigFile(config_dir_, dc) && !dc.hosts.empty()) {
+      std::snprintf(host_buf_, sizeof(host_buf_), "%s", dc.hosts[0].c_str());
+    } else if (s.headset_addr[0]) {
+      std::string addr = s.headset_addr;
+      size_t colon = addr.find(':');
+      if (colon != std::string::npos) addr = addr.substr(0, colon);
+      std::snprintf(host_buf_, sizeof(host_buf_), "%s", addr.c_str());
+    }
+    config_loaded_ = true;
+  }
+
   ImGuiIO &io = ImGui::GetIO();
   ImGui::SetNextWindowPos(ImVec2(0, 0));
   ImGui::SetNextWindowSize(io.DisplaySize);
@@ -196,7 +215,22 @@ void Dashboard::Render(const QlhsStatus &s, bool is_connected_and_fresh, ShmRead
   const char *headset_name = s.headset[0] ? s.headset : "—";
   draw->AddText(font, 26.0f, ImVec2(x1 + 22.0f, top + 44.0f), ToImU32(col::text), headset_name);
 
-  draw_row(x1, top + 100.0f, "Address", s.headset_addr[0] ? s.headset_addr : "—");
+  std::string addr_display;
+  uint32_t addr_color = col::text;
+  if (s.headset_addr[0]) {
+    addr_display = s.headset_addr;
+    if (s.state == QLHS_SEARCHING || s.state == QLHS_CONNECTING) {
+      addr_display += " (target)";
+      addr_color = col::amber;
+    }
+  } else if (host_buf_[0]) {
+    addr_display = std::string(host_buf_) + " (target)";
+    addr_color = col::amber;
+  } else {
+    addr_display = "Auto (broadcast)";
+    addr_color = col::dim;
+  }
+  draw_row(x1, top + 100.0f, "Address", addr_display, addr_color);
   draw_row(x1, top + 134.0f, "Cameras",
            s.cam_fps > 0.5 ? Formatted("%.0f frames/s", s.cam_fps) : "—",
            (s.cam_fps > 0.5 || s.state < QLHS_NO_CAMERAS) ? col::text : col::red);
@@ -266,6 +300,11 @@ void Dashboard::Render(const QlhsStatus &s, bool is_connected_and_fresh, ShmRead
   draw->AddRectFilled(ImVec2(ox + 48.0f, ly), ImVec2(ox + 48.0f + bar_w, ly + lh), ToImU32(col::card), 14.0f);
   draw->AddText(font, 16.0f, ImVec2(ox + 70.0f, ly + 16.0f), ToImU32(col::faint), "LOG");
 
+  const char *settings_note = "Settings: $XDG_CONFIG_HOME/questlhsync";
+  ImVec2 set_sz = font->CalcTextSizeA(16.0f, FLT_MAX, 0.0f, settings_note);
+  draw->AddText(font, 16.0f, ImVec2(ox + 48.0f + bar_w - 22.0f - set_sz.x, ly + 16.0f),
+                ToImU32(col::faint), settings_note);
+
   uint32_t n = s.nlog;
   int shown = 0;
   for (uint32_t i = 0; i < 5 && i < n; ++i) {
@@ -310,21 +349,72 @@ void Dashboard::Render(const QlhsStatus &s, bool is_connected_and_fresh, ShmRead
   // Button 1: Pause / Resume corrections
   const char *pause_label = s.paused ? "Resume corrections" : "Pause corrections";
   QlhsCmd pause_cmd = s.paused ? QLHS_CMD_RESUME : QLHS_CMD_PAUSE;
-  render_button("btn_pause", ox + 48.0f, 240.0f, pause_label, s.paused != 0, false, pause_cmd);
+  render_button("btn_pause", ox + 48.0f, 210.0f, pause_label, s.paused != 0, false, pause_cmd);
 
   // Button 2: Record session / Stop recording
   const char *rec_label = s.recording ? "Stop recording" : "Record session";
   QlhsCmd rec_cmd = s.recording ? QLHS_CMD_RECORD_OFF : QLHS_CMD_RECORD_ON;
-  render_button("btn_rec", ox + 304.0f, 210.0f, rec_label, false, s.recording != 0, rec_cmd);
+  render_button("btn_rec", ox + 274.0f, 170.0f, rec_label, false, s.recording != 0, rec_cmd);
 
   // Button 3: Force recalibrate
-  render_button("btn_recal", ox + 530.0f, 240.0f, "Force recalibrate", false, false, QLHS_CMD_RECALIBRATE);
+  render_button("btn_recal", ox + 460.0f, 180.0f, "Force recalibrate", false, false, QLHS_CMD_RECALIBRATE);
 
-  // Settings note on the right
-  const char *settings_note = "Settings: $XDG_CONFIG_HOME/questlhsync";
-  ImVec2 set_sz = font->CalcTextSizeA(16.0f, FLT_MAX, 0.0f, settings_note);
-  draw->AddText(font, 16.0f, ImVec2(ox + 1280.0f - 48.0f - set_sz.x, by + 14.0f),
-                ToImU32(col::faint), settings_note);
+  // Target Headset IP controls
+  float ip_lbl_x = ox + 660.0f;
+  draw->AddText(font, 17.0f, ImVec2(ip_lbl_x, by + 13.0f), ToImU32(col::dim), "Target IP:");
+
+  float ip_input_x = ip_lbl_x + 85.0f;
+  float ip_input_w = 175.0f;
+  float input_h = 36.0f;
+  float input_y = by + (bh - input_h) / 2.0f;
+
+  ImGui::PushStyleColor(ImGuiCol_FrameBg, ToImVec4(col::card2));
+  ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ToImVec4(col::line));
+  ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ToImVec4(col::line));
+  ImGui::PushStyleColor(ImGuiCol_Text, ToImVec4(col::text));
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
+
+  ImGui::SetCursorScreenPos(ImVec2(ip_input_x, input_y));
+  ImGui::SetNextItemWidth(ip_input_w);
+  bool enter_pressed = ImGui::InputTextWithHint("##target_ip", "e.g. 192.168.1.113", host_buf_, sizeof(host_buf_),
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+
+  ImGui::PopStyleVar(2);
+  ImGui::PopStyleColor(4);
+
+  // Connect button
+  float cbtn_x = ip_input_x + ip_input_w + 12.0f;
+  float cbtn_w = 100.0f;
+  ImGui::SetCursorScreenPos(ImVec2(cbtn_x, input_y));
+  ImGui::InvisibleButton("btn_set_ip", ImVec2(cbtn_w, input_h));
+  bool btn_hovered = ImGui::IsItemHovered();
+  bool btn_clicked = ImGui::IsItemClicked() || enter_pressed;
+
+  uint32_t btn_col = btn_hovered ? col::blue : col::card2;
+  draw->AddRectFilled(ImVec2(cbtn_x, input_y), ImVec2(cbtn_x + cbtn_w, input_y + input_h), ToImU32(btn_col), 8.0f);
+  ImVec2 cbtn_sz = font->CalcTextSizeA(17.0f, FLT_MAX, 0.0f, "Connect");
+  draw->AddText(font, 17.0f, ImVec2(cbtn_x + (cbtn_w - cbtn_sz.x) / 2.0f, input_y + (input_h - cbtn_sz.y) / 2.0f),
+                ToImU32(col::text), "Connect");
+
+  if (btn_clicked) {
+    std::string ip_to_set = host_buf_;
+    while (!ip_to_set.empty() && isspace((unsigned char)ip_to_set.front())) ip_to_set.erase(ip_to_set.begin());
+    while (!ip_to_set.empty() && isspace((unsigned char)ip_to_set.back())) ip_to_set.pop_back();
+    std::snprintf(host_buf_, sizeof(host_buf_), "%s", ip_to_set.c_str());
+
+    SaveConfigFile(config_dir_, ip_to_set);
+    if (reader) {
+      reader->SendCommand(QLHS_CMD_RELOAD_CONFIG);
+    }
+    feedback_msg_ = ip_to_set.empty() ? "Reset to Auto" : "Target saved!";
+    feedback_until_ = QpcNow() + 3.0;
+  }
+
+  // Feedback message
+  if (QpcNow() < feedback_until_ && !feedback_msg_.empty()) {
+    draw->AddText(font, 15.0f, ImVec2(cbtn_x + cbtn_w + 12.0f, by + 14.0f), ToImU32(col::green), feedback_msg_.c_str());
+  }
 
   ImGui::End();
   ImGui::PopStyleVar(3);

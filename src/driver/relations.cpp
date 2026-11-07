@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <ctime>
 #include <unistd.h>
+#if defined(__linux__) && defined(__x86_64__)
+#include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
+#include <sys/mman.h>
+#endif
 
 static uint64_t GetTickCount64() {
   struct timespec ts;
@@ -55,6 +61,34 @@ uint64_t Detour(void *self, uint64_t a, uint64_t b, const float *rel, uint64_t s
   } catch (...) {
   }
   return g_orig(self, a, b, use ? avg : rel, s5, s6, s7, s8);
+}
+#elif defined(__linux__) && defined(__x86_64__)
+const char kMoving[] = "Moving base %08X %.0fmm and %.1f deg because of relationship with %08X";
+// SysV x86_64 prologue of driver_lighthouse.so's relationship step (16 bytes):
+// push rbp; mov rsp, rbp; push r15; push r14; mov rdi, r14; push r13; mov edx, r13d; followed by push r12; mov esi, r12d
+const uint8_t kPrologue[16] = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56,
+                               0x49, 0x89, 0xFE, 0x41, 0x55, 0x41, 0x89, 0xD5};
+const uint8_t kArgs2[5] = {0x41, 0x54, 0x41, 0x89, 0xF4};
+
+// In SysV x86_64 ABI, the 28-byte pose struct (7 floats) is passed by value on the stack, and variance in xmm0
+struct RelPose {
+  float f[7];
+};
+using RelFn = uint64_t (*)(void *, uint32_t, uint32_t, RelPose, float, uint64_t, uint64_t, uint64_t);
+RelFn g_orig = nullptr;
+Relations *g_self = nullptr;
+uint8_t *g_trampoline = nullptr;
+uint8_t g_saved_bytes[16] = {};
+
+uint64_t Detour(void *self, uint32_t a, uint32_t b, RelPose rel, float variance, uint64_t s5, uint64_t s6,
+                uint64_t s7) {
+  RelPose avg = rel;
+  bool use = false;
+  try {
+    use = g_self && g_self->Average(a, b, rel.f, avg.f);
+  } catch (...) {
+  }
+  return g_orig(self, a, b, use ? avg : rel, variance, s5, s6, s7);
 }
 #endif
 
@@ -186,9 +220,134 @@ bool Relations::Hook() {
 void Relations::Unhook() {
   if (target_) MH_DisableHook(target_);
 }
+#elif defined(__linux__) && defined(__x86_64__)
+void *Relations::Find(void *module, std::string &why) {
+  auto *base = (uint8_t *)module;
+  if (!base) { why = "no module base"; return nullptr; }
+  auto *ehdr = (const Elf64_Ehdr *)base;
+  if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 || ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+    why = "not an ELF64 image";
+    return nullptr;
+  }
+  auto *phdr = (const Elf64_Phdr *)(base + ehdr->e_phoff);
+  int nph = ehdr->e_phnum;
+  const uint8_t *str = nullptr;
+  for (int i = 0; i < nph && !str; i++) {
+    if (phdr[i].p_type != PT_LOAD || (phdr[i].p_flags & PF_X)) continue;
+    const uint8_t *p = base + phdr[i].p_vaddr, *e = p + phdr[i].p_filesz;
+    for (; p + sizeof kMoving <= e; p++)
+      if (*p == 'M' && !memcmp(p, kMoving, sizeof kMoving - 1)) { str = p; break; }
+  }
+  if (!str) { why = "no base station move in it"; return nullptr; }
+  const uint8_t *ref = nullptr, *seg_lo = nullptr;
+  for (int i = 0; i < nph && !ref; i++) {
+    if (phdr[i].p_type != PT_LOAD || !(phdr[i].p_flags & PF_X)) continue;
+    const uint8_t *p = base + phdr[i].p_vaddr, *e = p + phdr[i].p_filesz;
+    for (; p + 7 <= e; p++) {
+      if ((p[0] != 0x48 && p[0] != 0x4C) || p[1] != 0x8D || (p[2] & 0xC7) != 0x05) continue;  // lea r, [rip+d]
+      int32_t d;
+      memcpy(&d, p + 3, 4);
+      if (p + 7 + d == str) { ref = p; seg_lo = base + phdr[i].p_vaddr; break; }
+    }
+  }
+  if (!ref) { why = "nothing loads its move line"; return nullptr; }
+  const uint8_t *lo = (ref - seg_lo > 0x1000) ? (ref - 0x1000) : seg_lo;
+  for (const uint8_t *p = ref; p >= lo; p--) {
+    if (!memcmp(p, kPrologue, sizeof kPrologue) && !memcmp(p + sizeof kPrologue, kArgs2, sizeof kArgs2))
+      return (void *)p;
+  }
+  why = "its relationship step takes other arguments";
+  return nullptr;
+}
+
+bool Relations::Hook() {
+  if (target_) return true;
+  void *mod = nullptr;
+  dl_iterate_phdr(
+      [](struct dl_phdr_info *info, size_t /*size*/, void *data) -> int {
+        if (!info->dlpi_name || !info->dlpi_addr) return 0;
+        const char *s = strstr(info->dlpi_name, "driver_lighthouse.so");
+        if (s && s[strlen("driver_lighthouse.so")] == '\0') {
+          *(void **)data = (void *)info->dlpi_addr;
+          return 1;
+        }
+        return 0;
+      },
+      &mod);
+  if (!mod) return false;
+  std::string why;
+  void *fn = Find(mod, why);
+  if (!fn) {
+    log_("SteamVR's lighthouse driver isn't one this version knows (" + why +
+         "): base stations placed as SteamVR places them");
+    return true;
+  }
+  if (!g_trampoline) {
+    void *mem = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+      log_("hooking SteamVR's base station placement failed: base stations placed as SteamVR places them");
+      return true;
+    }
+    g_trampoline = (uint8_t *)mem;
+  } else {
+    mprotect(g_trampoline, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+  }
+  memcpy(g_saved_bytes, fn, 16);
+  memcpy(g_trampoline, fn, 16);
+  g_trampoline[16] = 0xFF;
+  g_trampoline[17] = 0x25;
+  memset(g_trampoline + 18, 0, 4);
+  uint64_t ret_addr = (uint64_t)((uint8_t *)fn + 16);
+  memcpy(g_trampoline + 22, &ret_addr, 8);
+  mprotect(g_trampoline, 4096, PROT_READ | PROT_EXEC);
+  __builtin___clear_cache((char *)g_trampoline, (char *)g_trampoline + 32);
+
+  uintptr_t page_sz = (uintptr_t)sysconf(_SC_PAGESIZE);
+  uintptr_t p0 = (uintptr_t)fn & ~(page_sz - 1);
+  uintptr_t p1 = ((uintptr_t)fn + 16 + page_sz - 1) & ~(page_sz - 1);
+  if (mprotect((void *)p0, p1 - p0, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    log_("hooking SteamVR's base station placement failed: base stations placed as SteamVR places them");
+    return true;
+  }
+  g_self = this;
+  g_orig = (RelFn)g_trampoline;
+  uint8_t patch[16];
+  patch[0] = 0xFF;
+  patch[1] = 0x25;
+  memset(patch + 2, 0, 4);
+  uint64_t det_addr = (uint64_t)&Detour;
+  memcpy(patch + 6, &det_addr, 8);
+  patch[14] = 0x66;
+  patch[15] = 0x90;
+  memcpy(fn, patch, 16);
+  mprotect((void *)p0, p1 - p0, PROT_READ | PROT_EXEC);
+  __builtin___clear_cache((char *)fn, (char *)fn + 16);
+
+  target_ = fn;
+  size_t known = 0;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &kv : pairs_) known += kv.second.size();
+  }
+  log_(Fmt("base stations: SteamVR places them by the average of its measurements (%zu kept)", known));
+  return true;
+}
+
+void Relations::Unhook() {
+  if (!target_) return;
+  uintptr_t page_sz = (uintptr_t)sysconf(_SC_PAGESIZE);
+  uintptr_t p0 = (uintptr_t)target_ & ~(page_sz - 1);
+  uintptr_t p1 = ((uintptr_t)target_ + 16 + page_sz - 1) & ~(page_sz - 1);
+  if (mprotect((void *)p0, p1 - p0, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+    memcpy(target_, g_saved_bytes, 16);
+    mprotect((void *)p0, p1 - p0, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char *)target_, (char *)target_ + 16);
+  }
+  target_ = nullptr;
+}
 #else
 void *Relations::Find(void * /*module*/, std::string &why) {
-  why = "driver_lighthouse hooking is not supported on Linux";
+  why = "driver_lighthouse hooking is not supported on this platform";
   return nullptr;
 }
 
